@@ -8,8 +8,9 @@ which is included as part of this source code package.
 #ifndef DATA_PREPROCESS_HPP
 #define DATA_PREPROCESS_HPP
 
-#include "CustomMsg.h"  // Uncomment this line
 #include <Eigen/Core>
+#include <cstring>
+#include <filesystem>
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -23,6 +24,32 @@ which is included as part of this source code package.
 
 using namespace std;
 using namespace cv;
+
+// Minimal CDR reader with alignment handling (little-endian, ROS 2 encapsulation)
+struct CdrReader
+{
+    const uint8_t *base;
+    size_t pos, size;
+    CdrReader(const uint8_t *d, size_t n) : base(d), pos(4), size(n) {}  // skip 4-byte encapsulation header
+    bool enough(size_t extra) const { return pos + extra <= size; }
+    void align(size_t a) { pos = (pos + a - 1) / a * a; }
+    template <typename T>
+    bool read(T &v)
+    {
+        align(alignof(T));
+        if (!enough(sizeof(T))) return false;
+        std::memcpy(&v, base + pos, sizeof(T));
+        pos += sizeof(T);
+        return true;
+    }
+    bool skipString()
+    {
+        uint32_t len;
+        if (!read(len)) return false;
+        pos += len;  // string bytes (incl. null terminator)
+        return true;
+    }
+};
 
 class DataPreprocess
 {
@@ -45,16 +72,13 @@ public:
             return;
         }
 
-        // Check if bag file exists
-        std::fstream file_;
-        file_.open(bag_path, ios::in);
-        if (!file_) 
+        // Check if bag directory exists
+        if (!std::filesystem::exists(bag_path))
         {
             std::string msg = "Loading the rosbag " + bag_path + " failed";
             RCLCPP_ERROR(rclcpp::get_logger("data_preprocess"), "%s", msg.c_str());
             return;
         }
-        file_.close();
         
         RCLCPP_INFO(rclcpp::get_logger("data_preprocess"), "Loading the rosbag %s", bag_path.c_str());
         
@@ -150,33 +174,45 @@ public:
                 }
             }
         } else if (actual_topic_type == "livox_ros_driver2/msg/CustomMsg") {
-            RCLCPP_INFO(rclcpp::get_logger("data_preprocess"), 
-                       "Processing Livox CustomMsg messages...");
-            
+            RCLCPP_INFO(rclcpp::get_logger("data_preprocess"),
+                       "Processing Livox CustomMsg messages (manual CDR parse)...");
+
             while (reader.has_next()) {
                 auto bag_message = reader.read_next();
-                
-                if (bag_message->topic_name == lidar_topic) {
-                    try {
-                        // Access the raw serialized data
-                        const auto& serialized_data = bag_message->serialized_data;
-                        
-                        // For now, let's try to convert this to a standard PointCloud2
-                        // This is a workaround - you might need to adjust based on your actual data
-                        
-                        // Skip this message for now and log that we found it
-                        message_count++;
-                        
-                        if (message_count % 10 == 0) {
-                            RCLCPP_INFO(rclcpp::get_logger("data_preprocess"), 
-                                       "Found %d CustomMsg messages (conversion not implemented yet)", 
-                                       message_count);
-                        }
-                    } catch (const std::exception& e) {
-                        RCLCPP_ERROR(rclcpp::get_logger("data_preprocess"), 
-                                    "Error processing CustomMsg %d: %s", message_count, e.what());
-                        continue;
+
+                if (bag_message->topic_name != lidar_topic) continue;
+
+                const uint8_t *data = reinterpret_cast<const uint8_t *>(
+                    bag_message->serialized_data->buffer);
+                size_t data_size = bag_message->serialized_data->buffer_length;
+                CdrReader c(data, data_size);
+
+                // std_msgs/Header: int32 sec, uint32 nanosec, string frame_id
+                int32_t sec; uint32_t nanosec;
+                if (!c.read(sec) || !c.read(nanosec) || !c.skipString()) continue;
+                // timebase uint64, lidar_type uint8, lidar_id uint8, point_num uint32
+                uint64_t timebase; uint8_t lidar_type, lidar_id; uint32_t point_num;
+                if (!c.read(timebase) || !c.read(lidar_type) || !c.read(lidar_id) || !c.read(point_num)) continue;
+
+                cloud_input_->reserve(cloud_input_->size() + point_num);
+                for (uint32_t i = 0; i < point_num; ++i) {
+                    // CustomPoint {uint32 offset_time; float32 x,y,z; uint8 reflectivity,tag,line}
+                    c.align(4);
+                    if (!c.enough(16 + 3)) break;
+                    uint32_t offset_time; float x, y, z;
+                    c.read(offset_time); c.read(x); c.read(y); c.read(z);
+                    c.pos += 3;  // reflectivity, tag, line
+                    if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)) {
+                        pcl::PointXYZ pt;
+                        pt.x = x; pt.y = y; pt.z = z;
+                        cloud_input_->push_back(pt);
                     }
+                }
+                message_count++;
+                if (message_count % 50 == 0) {
+                    RCLCPP_INFO(rclcpp::get_logger("data_preprocess"),
+                               "Parsed %d CustomMsg messages, total points: %ld",
+                               message_count, cloud_input_->size());
                 }
             }
         } else {

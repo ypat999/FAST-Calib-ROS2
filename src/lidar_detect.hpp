@@ -14,6 +14,9 @@ which is included as part of this source code package.
 #include <opencv2/opencv.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/io/pcd_io.h>
+#include <cstdlib>
+#include <filesystem>
 #include "common_lib.h"
 
 class LidarDetect
@@ -21,6 +24,8 @@ class LidarDetect
 private:
     double x_min_, x_max_, y_min_, y_max_, z_min_, z_max_;
     double circle_radius_;
+    Eigen::Vector3d board_normal_;
+    double board_d_;
     std::shared_ptr<rclcpp::Node> node_;
 
     // 存储中间结果的点云
@@ -53,6 +58,8 @@ public:
         z_min_ = params.z_min;
         z_max_ = params.z_max;
         circle_radius_ = params.circle_radius;
+        board_normal_ = Eigen::Vector3d(params.board_nx, params.board_ny, params.board_nz);
+        board_d_ = params.board_d;
 
         filtered_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("filtered_cloud", 1);
         plane_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("plane_cloud", 1);
@@ -100,12 +107,27 @@ public:
 
         pcl::ModelCoefficients::Ptr plane_coefficients(new pcl::ModelCoefficients);
         pcl::PointIndices::Ptr plane_inliers(new pcl::PointIndices);
-        pcl::SACSegmentation<pcl::PointXYZ> plane_segmentation;
-        plane_segmentation.setModelType(pcl::SACMODEL_PLANE);
-        plane_segmentation.setMethodType(pcl::SAC_RANSAC);
-        plane_segmentation.setDistanceThreshold(0.01);
-        plane_segmentation.setInputCloud(filtered_cloud_);
-        plane_segmentation.segment(*plane_inliers, *plane_coefficients);
+        if (board_normal_.norm() > 0.5) {
+            // Board plane prior: keep a thin band around n·p + d = 0 instead of
+            // RANSAC (ground/wall otherwise win when the board is tilted).
+            Eigen::Vector3d n = board_normal_.normalized();
+            plane_inliers->indices.reserve(filtered_cloud_->size());
+            for (size_t i = 0; i < filtered_cloud_->size(); ++i) {
+                const pcl::PointXYZ &p = filtered_cloud_->points[i];
+                if (std::abs(n.x() * p.x + n.y() * p.y + n.z() * p.z + board_d_) < 0.02)
+                    plane_inliers->indices.push_back(i);
+            }
+            plane_coefficients->values = {n.x(), n.y(), n.z(), board_d_};
+            RCLCPP_INFO(node_->get_logger(), "Board band filter: %ld inliers",
+                        plane_inliers->indices.size());
+        } else {
+            pcl::SACSegmentation<pcl::PointXYZ> plane_segmentation;
+            plane_segmentation.setModelType(pcl::SACMODEL_PLANE);
+            plane_segmentation.setMethodType(pcl::SAC_RANSAC);
+            plane_segmentation.setDistanceThreshold(0.01);
+            plane_segmentation.setInputCloud(filtered_cloud_);
+            plane_segmentation.segment(*plane_inliers, *plane_coefficients);
+        }
     
         pcl::ExtractIndices<pcl::PointXYZ> extract;
         extract.setInputCloud(filtered_cloud_);
@@ -166,79 +188,119 @@ public:
         }
         RCLCPP_INFO(node_->get_logger(), "Extracted %ld edge points.", edge_cloud_->size());
 
-        // 5. 对边缘点进行聚类
-        pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
-        tree->setInputCloud(edge_cloud_);
-    
-        std::vector<pcl::PointIndices> cluster_indices;
-        pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
-        ec.setClusterTolerance(0.02);
-        ec.setMinClusterSize(50);
-        ec.setMaxClusterSize(1000);
-        ec.setSearchMethod(tree);
-        ec.setInputCloud(edge_cloud_);
-        ec.extract(cluster_indices);
-    
-        RCLCPP_INFO(node_->get_logger(), "Number of edge clusters: %ld", cluster_indices.size());
-    
-        // 6. 对每个聚类进行圆拟合
+        // Debug: dump intermediate clouds when FC_DEBUG_DUMP is set
+        if (getenv("FC_DEBUG_DUMP")) {
+            std::filesystem::create_directories("/home/ywj/tmp/fc_debug");
+            pcl::io::savePCDFileBinary("/home/ywj/tmp/fc_debug/filtered.pcd", *filtered_cloud_);
+            pcl::io::savePCDFileBinary("/home/ywj/tmp/fc_debug/plane.pcd", *plane_cloud_);
+            pcl::io::savePCDFileBinary("/home/ywj/tmp/fc_debug/aligned.pcd", *aligned_cloud_);
+            pcl::io::savePCDFileBinary("/home/ywj/tmp/fc_debug/edge.pcd", *edge_cloud_);
+            RCLCPP_INFO(node_->get_logger(), "Plane normal: (%.3f, %.3f, %.3f), d=%.3f, average_z=%.3f",
+                        normal.x(), normal.y(), normal.z(), plane_coefficients->values[3], average_z);
+        }
+
+        // 5+6. 圆检测。
+        // 有板平面先验时（静态 bag 累积点云稀疏、噪声把孔环与板轮廓粘成一团，
+        // Euclidean 聚类无法拆出 4 个孔）：直接在全部边缘点上迭代拟合圆并剥离
+        // inlier，直到凑够 4 个半径匹配的圆。
+        // 无先验时保持原始"聚类 + 逐聚类圆拟合"流程。
         center_z0_cloud_->clear();
         center_z0_cloud_->reserve(4);
         Eigen::Matrix3d R_inv = R.inverse();
-    
-        // 对每个聚类进行圆拟合
-        for (size_t i = 0; i < cluster_indices.size(); ++i) 
-        {
-            pcl::PointCloud<pcl::PointXYZ>::Ptr cluster(new pcl::PointCloud<pcl::PointXYZ>);
-            for (const auto& idx : cluster_indices[i].indices) {
-                cluster->push_back(edge_cloud_->points[idx]);
-            }
-    
-            // 圆拟合
-            pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
-            pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
-            pcl::SACSegmentation<pcl::PointXYZ> seg;
-            seg.setOptimizeCoefficients(true);
-            seg.setModelType(pcl::SACMODEL_CIRCLE2D);
-            seg.setMethodType(pcl::SAC_RANSAC);
-            seg.setDistanceThreshold(0.01);
-            seg.setMaxIterations(1000);
-            seg.setInputCloud(cluster);
-            seg.segment(*inliers, *coefficients);
-    
-            if (inliers->indices.size() > 0) 
+
+        auto accept_circle = [&](const pcl::ModelCoefficients::Ptr &coefficients,
+                                 const pcl::PointCloud<pcl::PointXYZ> &cluster,
+                                 const pcl::PointIndices::Ptr &inliers) {
+            double error = 0.0;
+            for (const auto &idx : inliers->indices)
             {
-                // 计算拟合误差
-                double error = 0.0;
-                for (const auto& idx : inliers->indices) 
-                {
-                    double dx = cluster->points[idx].x - coefficients->values[0];
-                    double dy = cluster->points[idx].y - coefficients->values[1];
-                    double distance = sqrt(dx * dx + dy * dy) - circle_radius_;
-                    error += abs(distance);
-                }
-                error /= inliers->indices.size();
-    
-                // 如果拟合误差较小，则认为是一个圆洞
-                if (error < 0.02) 
-                {
-                    // 将恢复后的圆心坐标添加到点云中
-                    pcl::PointXYZ center_point;
-                    center_point.x = coefficients->values[0];
-                    center_point.y = coefficients->values[1];
-                    center_point.z = 0.0;
-                    center_z0_cloud_->push_back(center_point);
+                double dx = cluster.points[idx].x - coefficients->values[0];
+                double dy = cluster.points[idx].y - coefficients->values[1];
+                error += std::abs(sqrt(dx * dx + dy * dy) - circle_radius_);
+            }
+            error /= inliers->indices.size();
+            if (error >= 0.02)
+                return false;
 
-                    // 将圆心坐标逆变换回原始坐标系
-                    Eigen::Vector3d aligned_point(center_point.x, center_point.y, center_point.z + average_z);
-                    Eigen::Vector3d original_point = R_inv * aligned_point;
+            pcl::PointXYZ center_point;
+            center_point.x = coefficients->values[0];
+            center_point.y = coefficients->values[1];
+            center_point.z = 0.0;
+            center_z0_cloud_->push_back(center_point);
 
-                    pcl::PointXYZ center_point_origin;
-                    center_point_origin.x = original_point.x();
-                    center_point_origin.y = original_point.y();
-                    center_point_origin.z = original_point.z();
-                    center_cloud->points.push_back(center_point_origin);
+            // 将圆心坐标逆变换回原始坐标系
+            Eigen::Vector3d aligned_point(center_point.x, center_point.y, center_point.z + average_z);
+            Eigen::Vector3d original_point = R_inv * aligned_point;
+
+            center_cloud->points.push_back(pcl::PointXYZ(original_point.x(), original_point.y(), original_point.z()));
+            return true;
+        };
+
+        if (board_normal_.norm() > 0.5) {
+            pcl::PointCloud<pcl::PointXYZ>::Ptr work_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+            *work_cloud = *edge_cloud_;
+            for (int it = 0; it < 8 && center_z0_cloud_->size() < 4 && work_cloud->size() >= 50; ++it) {
+                pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
+                pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
+                pcl::SACSegmentation<pcl::PointXYZ> seg;
+                seg.setOptimizeCoefficients(true);
+                seg.setModelType(pcl::SACMODEL_CIRCLE2D);
+                seg.setMethodType(pcl::SAC_RANSAC);
+                seg.setDistanceThreshold(0.01);
+                seg.setMaxIterations(2000);
+                seg.setInputCloud(work_cloud);
+                seg.segment(*inliers, *coefficients);
+                if (inliers->indices.size() < 50)
+                    break;
+                bool ok = accept_circle(coefficients, *work_cloud, inliers);
+                RCLCPP_INFO(node_->get_logger(), "Circle iter %d: c=(%.3f, %.3f) r=%.3f n=%zu %s",
+                            it, coefficients->values[0], coefficients->values[1],
+                            sqrt(coefficients->values[2]), inliers->indices.size(),
+                            ok ? "accepted" : "rejected");
+                // 无论接受与否都剥离这批 inlier，避免同一圆被重复拟合
+                std::vector<bool> keep(work_cloud->size(), true);
+                for (const auto &idx : inliers->indices) keep[idx] = false;
+                pcl::PointCloud<pcl::PointXYZ> peeled;
+                peeled.reserve(work_cloud->size());
+                for (size_t i = 0; i < work_cloud->size(); ++i)
+                    if (keep[i]) peeled.push_back(work_cloud->points[i]);
+                *work_cloud = peeled;
+            }
+        } else {
+            pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+            tree->setInputCloud(edge_cloud_);
+
+            std::vector<pcl::PointIndices> cluster_indices;
+            pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+            ec.setClusterTolerance(0.02);
+            ec.setMinClusterSize(50);
+            ec.setMaxClusterSize(20000);
+            ec.setSearchMethod(tree);
+            ec.setInputCloud(edge_cloud_);
+            ec.extract(cluster_indices);
+
+            RCLCPP_INFO(node_->get_logger(), "Number of edge clusters: %ld", cluster_indices.size());
+
+            for (size_t i = 0; i < cluster_indices.size(); ++i)
+            {
+                pcl::PointCloud<pcl::PointXYZ>::Ptr cluster(new pcl::PointCloud<pcl::PointXYZ>);
+                for (const auto &idx : cluster_indices[i].indices) {
+                    cluster->push_back(edge_cloud_->points[idx]);
                 }
+
+                pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
+                pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
+                pcl::SACSegmentation<pcl::PointXYZ> seg;
+                seg.setOptimizeCoefficients(true);
+                seg.setModelType(pcl::SACMODEL_CIRCLE2D);
+                seg.setMethodType(pcl::SAC_RANSAC);
+                seg.setDistanceThreshold(0.01);
+                seg.setMaxIterations(1000);
+                seg.setInputCloud(cluster);
+                seg.segment(*inliers, *coefficients);
+
+                if (inliers->indices.size() > 0)
+                    accept_circle(coefficients, *cluster, inliers);
             }
         }
     }

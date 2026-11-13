@@ -47,6 +47,7 @@ struct Params {
   double fx, fy, cx, cy, k1, k2, p1, p2;
   double marker_size, delta_width_qr_center, delta_height_qr_center;
   double delta_width_circles, delta_height_circles, circle_radius;
+  double board_nx, board_ny, board_nz, board_d;
   int min_detected_markers;
   string image_path;
   string bag_path;
@@ -84,6 +85,13 @@ Params loadParameters(std::shared_ptr<rclcpp::Node> node) {
   node->declare_parameter("y_max", 2.0);
   node->declare_parameter("z_min", -0.5);
   node->declare_parameter("z_max", 2.0);
+  // Optional board plane prior in lidar frame: n·p + d = 0.
+  // When |n| > 0.5 the RANSAC plane step is replaced by a thin band filter
+  // around this plane (needed when ground/wall dominate the PassThrough box).
+  node->declare_parameter("board_normal_x", 0.0);
+  node->declare_parameter("board_normal_y", 0.0);
+  node->declare_parameter("board_normal_z", 0.0);
+  node->declare_parameter("board_d", 0.0);
 
   // Get parameter values with error handling
   try {
@@ -112,6 +120,10 @@ Params loadParameters(std::shared_ptr<rclcpp::Node> node) {
     params.y_max = node->get_parameter("y_max").as_double();
     params.z_min = node->get_parameter("z_min").as_double();
     params.z_max = node->get_parameter("z_max").as_double();
+    params.board_nx = node->get_parameter("board_normal_x").as_double();
+    params.board_ny = node->get_parameter("board_normal_y").as_double();
+    params.board_nz = node->get_parameter("board_normal_z").as_double();
+    params.board_d = node->get_parameter("board_d").as_double();
   } catch (const std::exception& e) {
     RCLCPP_ERROR(node->get_logger(), "Error loading parameters: %s", e.what());
     throw;

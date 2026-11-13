@@ -8,8 +8,8 @@ which is included as part of this source code package.
 #ifndef QR_DETECT_HPP
 #define QR_DETECT_HPP
 
-#include <cv_bridge/cv_bridge.hpp>
-#include <image_geometry/pinhole_camera_model.hpp>
+#include <cv_bridge/cv_bridge.h>
+#include <image_geometry/pinhole_camera_model.h>
 #include <rclcpp/rclcpp.hpp>
 #include <opencv2/aruco.hpp>
 #include <opencv2/opencv.hpp>

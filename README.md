@@ -43,6 +43,59 @@ ros2 launch fast_calib calib_launch.py
 5. Set distance filter in `qr_params.yaml` for board point cloud (extra points are acceptable).
 6. Calibrate now!
 
+### 3.1 Data acquisition tips
+
+- **Keep the sensor rig and the target static while recording.** All point cloud
+  frames in a bag are accumulated into a single cloud without motion
+  compensation, so a hand-held or moving recording will smear the board and
+  break the circle extraction. Mount the rig on a tripod (or put the board on a
+  stand) and record 1-2 s per shot.
+- Keep the whole board inside both the camera FoV and the LiDAR FoV, roughly
+  facing the sensors, and inside the distance filter range (`x_min`~`x_max`,
+  `y_min`~`y_max`, `z_min`~`z_max`).
+- Capture one image per shot, at the same pose as the bag. Image and bag are
+  paired by index in `bag_paths` / `image_paths`.
+
+### 3.2 Multi-shot calibration (recommended)
+
+A single shot already fully constrains the 6-DoF extrinsic (4 circle centers
+paired with 4 ArUco centers). Recording several shots from different viewpoints
+and letting the tool pick the best consensus is more robust against partial
+circle extraction or mis-ordered centers.
+
+1. Record N static shots, each as one bag plus one image.
+2. Fill both lists in `qr_params.yaml` (order matters, same index = same shot):
+
+```yaml
+bag_paths:
+  - "/path/to/shot1_bag"
+  - "/path/to/shot2_bag"
+  - "/path/to/shot3_bag"
+image_paths:
+  - "/path/to/shot1.png"
+  - "/path/to/shot2.png"
+  - "/path/to/shot3.png"
+```
+
+3. Launch as usual: `ros2 launch fast_calib calib_launch.py`
+
+How it works:
+
+1. Each shot is solved independently (detection + SVD), producing its own
+   extrinsic and RMSE. Shots with incomplete detections are skipped.
+2. An adaptive inlier threshold is derived from the median single-shot RMSE
+   (`max(3 x median, 0.04 m)`).
+3. A RANSAC-style consensus keeps the shots that agree with the best-supported
+   extrinsic; inconsistent shots (bad detection, wrong center ordering) are
+   reported as outliers and discarded.
+4. All inlier correspondences are stacked and solved once with a joint SVD,
+   giving the least-squares optimal extrinsic over all shots.
+
+The terminal output lists per-shot `single_rmse` / `final_rmse` with an
+`INLIER` / `outlier` flag, plus the global RMSE and the final transformation.
+If `bag_paths` / `image_paths` are left empty, the tool falls back to the
+single `bag_path` / `image_path`.
+
 <p align="center">
   <img src="./pics/calibration_target.jpg" width="100%">
   <font color=#a0a0a0 size=2>Left: Actual calibration target | Right: Technical drawing with annotated dimensions.</font>

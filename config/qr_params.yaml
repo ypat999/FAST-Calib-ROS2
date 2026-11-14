@@ -31,6 +31,17 @@ fast_calib:
     bag_path: "/home/maro/Pictures/rosbag2_2025_07_11-21_17_03"
     image_path: "/home/maro/Pictures/00.png"
 
+    # Multi-shot calibration (optional): when these lists are non-empty they
+    # take priority over the single bag_path/image_path above. Each bag is
+    # paired with the image at the same index; record each shot statically.
+    bag_paths: []
+    image_paths: []
+    #   - "/path/to/bag1"
+    #   - "/path/to/bag2"
+    # image_paths:
+    #   - "/path/to/img1.png"
+    #   - "/path/to/img2.png"
+
     # Output
     output_path: "/home/parallels/bag_image/bag_images"
 

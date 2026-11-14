@@ -51,6 +51,8 @@ struct Params {
   int min_detected_markers;
   string image_path;
   string bag_path;
+  vector<string> bag_paths;   // 多角度：多段 bag 与图像一一对应
+  vector<string> image_paths;
   string lidar_topic;
   string output_path;
 };
@@ -77,6 +79,8 @@ Params loadParameters(std::shared_ptr<rclcpp::Node> node) {
   node->declare_parameter("circle_radius", 0.12);
   node->declare_parameter("image_path", std::string("/path/to/image.png"));
   node->declare_parameter("bag_path", std::string("/path/to/input.bag"));
+  node->declare_parameter("bag_paths", std::vector<std::string>{});
+  node->declare_parameter("image_paths", std::vector<std::string>{});
   node->declare_parameter("lidar_topic", std::string("/livox/lidar"));
   node->declare_parameter("output_path", std::string("/media/psf/Home/FAST-Calib/bag_images"));
   node->declare_parameter("x_min", 1.5);
@@ -112,6 +116,8 @@ Params loadParameters(std::shared_ptr<rclcpp::Node> node) {
     params.circle_radius = node->get_parameter("circle_radius").as_double();
     params.image_path = node->get_parameter("image_path").as_string();
     params.bag_path = node->get_parameter("bag_path").as_string();
+    params.bag_paths = node->get_parameter("bag_paths").as_string_array();
+    params.image_paths = node->get_parameter("image_paths").as_string_array();
     params.lidar_topic = node->get_parameter("lidar_topic").as_string();
     params.output_path = node->get_parameter("output_path").as_string();
     params.x_min = node->get_parameter("x_min").as_double();

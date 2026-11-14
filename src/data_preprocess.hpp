@@ -57,14 +57,12 @@ public:
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_input_;
     cv::Mat img_input_;
 
-    DataPreprocess(Params &params)
+    DataPreprocess(const Params &params, const string &bag_path, const string &image_path)
         : cloud_input_(new pcl::PointCloud<pcl::PointXYZ>)
     {
-        string bag_path = params.bag_path;
-        string image_path = params.image_path;
         string lidar_topic = params.lidar_topic;
 
-        img_input_ = cv::imread(params.image_path, cv::IMREAD_UNCHANGED);
+        img_input_ = cv::imread(image_path, cv::IMREAD_UNCHANGED);
         if (img_input_.empty()) 
         {
             std::string msg = "Loading the image " + image_path + " failed";

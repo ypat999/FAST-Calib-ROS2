@@ -35,8 +35,11 @@ fast_calib:
     # Multi-shot calibration (optional): when these lists are non-empty they
     # take priority over the single bag_path/image_path above. Each bag is
     # paired with the image at the same index; record each shot statically.
-    bag_paths: []
-    image_paths: []
+    # 注意：这两键**不能写成空列表 `[]`** —— rclcpp 会抛
+    #   InvalidParameterValueException: parameter_value_from failed for 'bag_paths'
+    # 节点启动即 abort（2026-11-17 实测）。不用多 shot 时整行注释掉即可，
+    # buildShots() 会自动回退到上面的单个 bag_path/image_path。
+    # bag_paths:
     #   - "/path/to/bag1"
     #   - "/path/to/bag2"
     # image_paths:

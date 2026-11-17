@@ -195,6 +195,18 @@ int main(int argc, char **argv)
       *all_qr += *results[j].qr_centers;
     }
 
+    // 落盘最终参与 Kabsch 求解的 4 对圆孔中心（相机系 / 雷达系，同一规范排序）。
+    // holefix 复标定需要「只替换雷达侧孔心、复用图侧孔心」，这两个中间量否则不落盘。
+    if (DEBUG) {
+      for (size_t k = 0; k < all_qr->size(); ++k)
+        std::cout << "[CentersQR] " << std::fixed << std::setprecision(9)
+                  << (*all_qr)[k].x << " " << (*all_qr)[k].y << " " << (*all_qr)[k].z << std::endl;
+      for (size_t k = 0; k < all_lidar->size(); ++k)
+        std::cout << "[CentersLidar] " << std::fixed << std::setprecision(9)
+                  << (*all_lidar)[k].x << " " << (*all_lidar)[k].y << " " << (*all_lidar)[k].z
+                  << std::endl;
+    }
+
     pcl::registration::TransformationEstimationSVD<pcl::PointXYZ, pcl::PointXYZ> svd;
     Eigen::Matrix4f transformation;
     svd.estimateRigidTransformation(*all_lidar, *all_qr, transformation);
